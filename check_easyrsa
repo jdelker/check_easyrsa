@@ -1,0 +1,186 @@
+#!/usr/bin/perl -w
+#
+# check_easyrsa
+#   Icinga script to check EsyRSA certificate expirations
+#
+# Copyright (c) 2020 Joerg Delker <jd@onix.de>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+#
+# Description:
+#   This script will check all certificates (including the CA certificate) of
+#   an EasyRSA installation.
+#
+# check_easyrsa -b /opt/EasyRSA
+#
+#
+use strict;
+use Time::Local;
+use Getopt::Long;
+use File::Find::Rule;
+use lib "/usr/lib/nagios/plugins";
+use utils qw(%ERRORS &print_revision &support &usage);
+
+my $PROGNAME="check_easyrsa";
+my $REVISION="1.0";
+
+#
+$ENV{PATH}="/usr/sbin:/usr/bin:/bin";
+
+#
+my $openssl = "/usr/bin/openssl";
+
+my $basedir;
+my $critical = 7;
+my $help;
+my $verbose;
+my $version;
+my $warning = 30;
+
+#
+my %months = ('Jan' => 0, 'Feb' => 1, 'Mar' => 2, 'Apr' => 3, 'May' => 4,
+	      'Jun' => 5, 'Jul' => 6, 'Aug' => 7, 'Sep' => 8, 'Oct' => 9,
+	      'Nov' => 10, 'Dec' => 11);
+
+#
+Getopt::Long::Configure('bundling');
+if (GetOptions(
+	       "b=s" => \$basedir,
+	       "h"   => \$help,
+	       "v"   => \$verbose,
+	       "V"   => \$version,
+				 "c=i" => \$critical,
+				 "w=i" => \$warning,
+	      ) == 0) {
+
+  print_usage();
+  exit $ERRORS{'UNKNOWN'}
+}
+
+if ($version) {
+  print_revision($PROGNAME, "\$Revision: $REVISION \$");
+  exit $ERRORS{'OK'};
+}
+
+if ($help) {
+  print_help();
+  exit $ERRORS{'OK'};
+}
+
+if (!$basedir) {
+	print_help();
+	exit $ERRORS{'UNKNOWN'};
+}
+
+# fetch all cert files
+my %certHash;
+my $ffr_obj = File::Find::Rule->file()
+                              ->name("*.crt")
+                              ->start($basedir."/pki");
+
+while (my $file = $ffr_obj->match()) {
+	# get certificate details
+	open(OPENSSL, "$openssl x509 -enddate -subject -serial -noout -in $file|") ||
+	  die "unable to open $openssl: $!";
+
+	my $deadline;
+	my $subject;
+	my $serial;
+	while (<OPENSSL>) {
+	  if (/^notAfter=(.*)/) { $deadline = $1; chomp($deadline); }
+		if (/^subject=(.*)/) { $subject = $1; chomp($subject); }
+		if (/^serial=(.*)/) { $serial = $1; chomp($serial); }
+	}
+	close(OPENSSL);
+
+	$certHash{$serial} = {
+		subject => $subject,
+		daysleft => calculateDaysLeft($deadline)
+	};
+}
+
+
+# build result
+my $status = $ERRORS{'OK'};
+my $msgs;
+for (keys %certHash) {
+	my $daysLeft = $certHash{$_}->{daysleft};
+	my $subject = $certHash{$_}->{subject};
+
+  if ($daysLeft < 0) {
+    $msgs.="$subject expired " . abs($daysLeft) . " day(s) ago. ";
+		$status = $ERRORS{'CRITICAL'};
+  } elsif ($daysLeft <= $critical) {
+    $msgs.="$subject expires in $daysLeft days. ";
+    $status = $ERRORS{'CRITICAL'};
+  } elsif ($daysLeft <= $warning) {
+    $msgs.="$subject expires in $daysLeft days. ";
+    $status = $ERRORS{'WARNING'} if $status eq $ERRORS{'OK'};
+  } elsif ($verbose) {
+    $msgs.= "$subject has $daysLeft day(s) left. ";
+  }
+}
+
+if ($status eq $ERRORS{'WARNING'}) {
+  print "$PROGNAME: WARNING - $msgs\n";
+} elsif ($status eq $ERRORS{'CRITICAL'}) {
+  print "$PROGNAME: CRITICAL - $msgs\n";
+} else {
+	print "$PROGNAME: OK - ";
+	if ($msgs) {
+		print $msgs;
+	} else {
+		print "".(scalar keys %certHash)." certifices verified\n";
+	}
+}
+exit $status;
+
+
+sub calculateDaysLeft {
+	my $date = shift;
+	$date =~ s/ +/ /g;
+	my ($month, $day, $hour, $min, $sec, $year, $tz) = split(/[\s+|:]/, $date);
+	#print "m=$month, d=$day, h=$hour, m=$min, s=$sec, y=$year, z=$tz\n";
+
+	return int((timegm($sec, $min, $hour, $day, $months{$month}, $year - 1900) - time()) / 86400);
+}
+
+sub print_help {
+  print_revision($PROGNAME, "\$Revision: $REVISION \$");
+  print "Copyright (c) 2020 Joerg Delker
+
+Check all certificates of an EasyRSA PKI
+
+";
+
+  print_usage();
+
+  print "
+-b dir	   full path of EasyRSA
+-h         show this help script
+-w <num>   exit with WARNING status if number of days left is less than <num>
+-c <num>   exit with CRITICAL status if number of days left is less than <num>
+-v         verbose output of OK state
+-V         show version and license information
+
+";
+  support();
+}
+
+
+sub print_usage {
+  print "Usage: $PROGNAME -b <basedir> [-c <critdays>] [-w <warndays>] [-v] [-V] [-h]\n";
+  return();
+}
